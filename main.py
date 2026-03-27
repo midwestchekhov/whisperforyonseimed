@@ -64,9 +64,13 @@ if OPENROUTER_API_KEY:
     )
     DEFAULT_OPENROUTER_MODEL = "google/gemini-3.1-flash-lite-preview"
     DEFAULT_SUBJECT_ROUTER_MODEL = os.getenv("SUBJECT_ROUTER_MODEL", "qwen/qwen3.5-9b")
+    DEFAULT_HIGHLIGHT_EXTRACT_MODEL = os.getenv("HIGHLIGHT_EXTRACT_MODEL", "qwen/qwen3.5-9b")
+    DEFAULT_HIGHLIGHT_SYNTHESIS_MODEL = os.getenv("HIGHLIGHT_SYNTHESIS_MODEL", DEFAULT_OPENROUTER_MODEL)
 else:
     openrouter_client = None
-    DEFAULT_SUBJECT_ROUTER_MODEL = "qwen/qwen3.5-9b"
+DEFAULT_SUBJECT_ROUTER_MODEL = "qwen/qwen3.5-9b"
+DEFAULT_HIGHLIGHT_EXTRACT_MODEL = "qwen/qwen3.5-9b"
+DEFAULT_HIGHLIGHT_SYNTHESIS_MODEL = "google/gemini-3.1-flash-lite-preview"
 
 # Initialize local Ollama client
 OLLAMA_CLIENT = OpenAI(
@@ -153,7 +157,6 @@ LOW_SIGNAL_ABBREVIATIONS = {
     "PM",
     "SK",
 }
-
 
 def _is_english_medical_term(term: str) -> bool:
     return bool(re.search(r"[A-Za-z]", term)) and not bool(re.search(r"[가-힣]", term))
@@ -243,6 +246,8 @@ CORRECTION_SYSTEM = (
 
 # 엔드포인트 컨텍스트 한계 (입출력 합산, Gemini 등 현대 모델 대응)
 CONTEXT_LIMIT = 200000
+HIGHLIGHT_EXTRACT_MAX_TOKENS = 700
+HIGHLIGHT_SYNTHESIS_MAX_TOKENS = 6000
 
 
 def _safe_max_tokens(system_msg: str, user_msg: str, desired: int = 16384) -> int:
@@ -264,6 +269,25 @@ def _safe_max_tokens(system_msg: str, user_msg: str, desired: int = 16384) -> in
     if result < adjusted_desired:
         print(f"  ⚠️  컨텍스트 초과 방지: max_tokens 시도 {adjusted_desired} → {result} (입력 추정 {estimated_input:,}토큰)")
     return result
+
+
+def _bounded_max_tokens(
+    system_msg: str,
+    user_msg: str,
+    *,
+    desired: int,
+    floor: int,
+) -> int:
+    """
+    추출/통합 레이어처럼 출력량이 비교적 예측 가능한 호출에 쓰는 보수 상한.
+    `_safe_max_tokens`처럼 출력 한도를 과도하게 키우지 않는다.
+    """
+    estimated_input = int((len(system_msg) + len(user_msg)) / 1.1)
+    safe = CONTEXT_LIMIT - estimated_input - 2000
+    if safe <= 0:
+        return floor
+    result = min(desired, safe)
+    return max(floor, result)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -530,6 +554,17 @@ def infer_title_subjects(lecture_title: str) -> set[str]:
         if keyword.lower() in normalized_title:
             inferred.update(subjects)
     return inferred
+
+
+def build_highlight_subject_hint(subjects: set[str] | list[str] | tuple[str, ...]) -> str:
+    normalized = sorted(
+        {
+            str(item).strip().lower().replace("-", " ")
+            for item in subjects
+            if str(item).strip()
+        }
+    )
+    return ", ".join(word.title() for word in normalized)
 
 
 def _load_subject_router_cache() -> dict[str, dict]:
@@ -1012,8 +1047,20 @@ def create_run_log(audio_name: str) -> dict:
         "run_id":     f"{Path(audio_name).stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
         "audio_file": audio_name,
         "timestamp":  datetime.now().isoformat(timespec="seconds"),
+        "artifacts": {},
         "injection": {},
         "correction_layer": {
+            "model":        "",
+            "input_chars":  0,
+            "output_chars": 0,
+        },
+        "highlight_extract_layer": {
+            "model":        "",
+            "input_chars":  0,
+            "output_chars": 0,
+            "chunks":       0,
+        },
+        "highlight_synthesis_layer": {
             "model":        "",
             "input_chars":  0,
             "output_chars": 0,
@@ -1029,6 +1076,26 @@ def create_run_log(audio_name: str) -> dict:
 def group_audio_stem(stem: str | Path) -> str:
     """파일명 말미의 분할 suffix를 제거해 그룹 키를 만든다."""
     return GROUP_SUFFIX_RE.sub("", normalize_nfc(str(stem)))
+
+
+def get_transcript_paths() -> list[Path]:
+    paths = list(OUTPUT_DIR.glob("*/transcript.txt"))
+    paths.extend(OUTPUT_DIR.glob("*_transcript.txt"))
+    return sorted(set(paths))
+
+
+def get_base_name_from_transcript_path(path: Path) -> str:
+    if path.parent != OUTPUT_DIR and path.name == "transcript.txt":
+        return path.parent.name
+    return group_audio_stem(strip_known_suffix(path.stem, "_transcript"))
+
+
+def get_corrected_transcript_paths() -> list[Path]:
+    return sorted(OUTPUT_DIR.glob("*_corrected_transcript.txt"))
+
+
+def get_base_name_from_corrected_path(path: Path) -> str:
+    return group_audio_stem(strip_known_suffix(path.stem, "_corrected_transcript"))
 
 
 def strip_known_suffix(stem: str, suffix: str) -> str:
@@ -1264,139 +1331,355 @@ def correct_with_jokbo(
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#   포맷 레이어: Bold 강조 + 통합 학습포인트
+#   하이라이트 레이어: 청크 추출 + 상위 통합
 # ════════════════════════════════════════════════════════════════════════════
 
-def _layer_c_system(medical_map: str) -> str:
-    return (
-        "당신은 의학 강의 정리 전문 조교입니다.\n"
-        f"이번 강의 핵심 키워드 (의학 지도): {medical_map}\n\n"
-        "미션:\n"
-        "1. 교정된 강의 전사문에서 족보(급분바 섹션)에 언급된 핵심 개념, "
-        "교수님이 강조한 부분(**시험 출제 예고**, **중요**, **꼭**)을 **Bold** 처리하세요.\n"
-        "2. 문장 구조와 교수님의 구어체 말투를 보존하세요. 임의 요약 금지.\n"
-        "3. 전사문 본문 출력이 끝난 후, 맨 마지막에 '## 학습 포인트' 섹션을 딱 한 번만 추가하여 "
-        "강의 전체의 핵심 시험 출제 포인트 5~10개를 bullet list로 정리하세요.\n"
-        "4. 불필요한 인사말 없이 마크다운 본문만 출력하세요."
-    )
+def get_llm_client_and_default_model(
+    *,
+    use_local: bool = False,
+    use_openrouter: bool = False,
+    purpose: str = "correction",
+) -> tuple[OpenAI | None, str]:
+    if use_local:
+        return OLLAMA_CLIENT, "qwen2.5:7b"
+    if use_openrouter:
+        if purpose == "highlight_extract":
+            return openrouter_client, DEFAULT_HIGHLIGHT_EXTRACT_MODEL
+        if purpose == "highlight_synthesis":
+            return openrouter_client, DEFAULT_HIGHLIGHT_SYNTHESIS_MODEL
+        return openrouter_client, DEFAULT_OPENROUTER_MODEL
+    return hf_client, RELIABLE_HF_MODEL_ID
 
 
-def _layer_c_user(jokbo_text: str, transcript: str) -> str:
-    # 컨텍스트 크기에 비례해 족보 한도 조정 (CONTEXT_LIMIT // 4 chars)
-    jokbo_limit = max(5000, CONTEXT_LIMIT // 4)
-    if jokbo_text:
-        if len(jokbo_text) > jokbo_limit:
-            ref = jokbo_text[:jokbo_limit]  # type: ignore[misc]
-            ref += "\n...(이하 생략)"
+def estimate_tokens(text: str) -> int:
+    return max(1, int(len(text) / 1.1))
+
+
+def chunk_text_by_estimated_tokens(
+    text: str,
+    *,
+    chunk_tokens: int = 2200,
+    overlap_tokens: int = 250,
+) -> list[dict[str, object]]:
+    if not text.strip():
+        return []
+
+    chunk_chars = int(chunk_tokens * 1.1)
+    overlap_chars = int(overlap_tokens * 1.1)
+    min_search_start = int(chunk_chars * 0.65)
+    chunks: list[dict[str, object]] = []
+    start = 0
+    text_len = len(text)
+
+    while start < text_len:
+        provisional_end = min(start + chunk_chars, text_len)
+        if provisional_end >= text_len:
+            end = text_len
         else:
-            ref = jokbo_text
-    else:
-        ref = "제공된 족보가 없습니다."
+            search_region = text[start + min_search_start:provisional_end]
+            boundary = max(
+                search_region.rfind("\n"),
+                search_region.rfind(". "),
+                search_region.rfind("? "),
+                search_region.rfind("! "),
+                search_region.rfind(".\n"),
+            )
+            end = provisional_end if boundary < 0 else start + min_search_start + boundary + 1
+
+        chunk_text = text[start:end].strip()
+        if chunk_text:
+            chunks.append({
+                "chunk_id": len(chunks) + 1,
+                "start_char": start,
+                "end_char": end,
+                "estimated_tokens": estimate_tokens(chunk_text),
+                "text": chunk_text,
+            })
+
+        if end >= text_len:
+            break
+        start = max(end - overlap_chars, start + 1)
+
+    return chunks
+
+
+def save_chunk_highlights(run_log: dict, chunk_records: list[dict]) -> Path:
+    path = LOG_DIR / f"{run_log['run_id']}_chunk_highlights.jsonl"
+    with open(path, "w", encoding="utf-8") as f:
+        for record in chunk_records:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    print(f"🧩  Chunk highlights 저장: {path}", flush=True)
+    return path
+
+
+def init_chunk_highlights_file(run_log: dict) -> Path:
+    path = LOG_DIR / f"{run_log['run_id']}_chunk_highlights.jsonl"
+    path.write_text("", encoding="utf-8")
+    return path
+
+
+def append_chunk_highlight(path: Path, record: dict) -> None:
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        f.flush()
+
+
+def render_extracted_notes(chunk_records: list[dict], *, lecture_title: str = "") -> str:
+    lines: list[str] = []
+    if lecture_title:
+        lines.append(f"# {lecture_title}")
+        lines.append("")
+    lines.append("# Chunk Extracted Notes")
+    lines.append("")
+    for record in chunk_records:
+        extracted = str(record.get("extracted_text", "")).strip()
+        if not extracted:
+            continue
+        lines.append(f"## Chunk {record.get('chunk_id')}")
+        lines.append(extracted)
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+
+def _render_extracted_notes_for_prompt(chunk_records: list[dict]) -> str:
+    lines: list[str] = []
+    for record in chunk_records:
+        extracted = str(record.get("extracted_text", "")).strip()
+        if not extracted:
+            continue
+        lines.append(f"## Chunk {record.get('chunk_id')}")
+        lines.append(extracted)
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def _highlight_extract_system() -> str:
     return (
-        f"### 족보 레퍼런스 (급분바 섹션)\n{ref}\n\n"
-        f"### 교정된 강의 전사문 (전체)\n{transcript}\n\n"
-        "#### 작업:\n"
-        "- 족보 키워드/개념 Bold 처리\n"
-        "- 교수님 강조 표현 Bold 처리\n"
-        "- 원문 뉘앙스 보존\n"
-        "- 전사문 끝에 '## 학습 포인트' 섹션을 딱 한 번만 추가\n"
+        "당신은 의학 강의 청크 추출기입니다.\n"
+        "요약이 아니라 추출만 하세요.\n"
+        "새 의학 사실을 만들지 말고, 청크에 있는 내용만 더 읽기 쉬운 문장으로 정리하세요.\n"
+        "불확실하면 과감히 생략하고, 확실한 정보만 남기세요.\n"
+        "JSON, 코드펜스, 번호 목록 없이 평문/마크다운만 출력하세요."
     )
 
 
-def emphasize_and_format(
+def _highlight_extract_user(
+    chunk: dict[str, object],
+    *,
+    lecture_title: str = "",
+    subject_hint: str = "",
+) -> str:
+    chunk_text = str(chunk["text"])
+    return (
+        f"강의명: {lecture_title or '미지정'}\n"
+        f"큰 분과: {subject_hint or '미지정'}\n"
+        f"청크 번호: {chunk['chunk_id']}\n"
+        "작업:\n"
+        "- 첫 줄은 짧은 소제목 1개로 쓰세요.\n"
+        "- 그 아래에 중요한 의학 내용만 4~5줄로 다시 적으세요.\n"
+        "- 문장은 짧고 단정하게 쓰세요.\n"
+        "- 하위 레이어이므로 자세한 설명, 중복, 장황한 문장은 피하세요.\n"
+        "- 확실하지 않은 말은 억지로 정리하지 말고 빼세요.\n"
+        "- bullet 없이 일반 줄글/줄바꿈 형식으로 쓰세요.\n"
+        "- 예시 형식:\n"
+        "미숙아 수분 및 수액 관리 원칙\n"
+        "34주부터 안전한 경우 경구 섭취를 시도한다.\n"
+        "피부 미성숙과 넓은 체표면적으로 insensible water loss가 많다.\n"
+        "체중 증가, 소변/대변량을 비교해 수분 용량을 조절한다.\n\n"
+        f"청크 원문:\n{chunk_text}"
+    )
+
+
+def _highlight_synthesis_system() -> str:
+    return (
+        "당신은 의학 강의 하이라이트 통합기입니다.\n"
+        "청크 추출 결과를 병합해 중복을 줄이되, 중요한 세부 내용은 보존하세요.\n"
+        "너무 짧게 압축하지 말고, 강의의 범위와 디테일이 충분히 남도록 정리하세요.\n"
+        "새 사실을 만들지 말고 제공된 추출 결과만 바탕으로 정리하세요.\n"
+        "마크다운만 출력하세요."
+    )
+
+
+def _highlight_synthesis_user(
+    chunk_records: list[dict],
+    *,
+    lecture_title: str = "",
+    subject_hint: str = "",
+) -> str:
+    extracted_notes = _render_extracted_notes_for_prompt(chunk_records)
+    return (
+        f"강의명: {lecture_title or '미지정'}\n"
+        f"큰 분과: {subject_hint or '미지정'}\n\n"
+        "아래는 corrected transcript를 청크 단위로 정제한 추출 노트입니다.\n"
+        "이걸 바탕으로 최종 정리본을 만드세요.\n\n"
+        "출력 형식:\n"
+        "## 핵심 개념\n"
+        "- 8개 이상, 누락보다 보존을 우선\n"
+        "## 시험 포인트\n"
+        "- 8개 이상, 수치/감별/처치 원칙 포함\n"
+        "## 구조화 메모\n"
+        "- 주제별 소제목과 bullet로 충분히 자세히\n"
+        "## 재청취 필요 구간\n"
+        "- ...\n\n"
+        "빈 청크는 무시하세요.\n"
+        "새 사실을 만들지 말고, 추출 노트에 있는 내용만 재조직화하세요.\n"
+        "의미가 다른 포인트를 하나로 과도하게 합치지 마세요.\n"
+        "가능하면 고유 질환명, 검사명, 감별 포인트, 수치 기준을 보존하세요.\n"
+        "최종 결과가 지나치게 짧아지지 않게 하세요.\n"
+        "압축보다 보존을 우선하세요.\n\n"
+        f"청크 추출 노트:\n{extracted_notes}"
+    )
+
+
+def extract_chunk_highlights(
     corrected_transcript: str,
-    jokbo_text: str,
-    medical_map: str,
+    subject_hint: str = "",
+    lecture_title: str = "",
+    *,
     use_local: bool = False,
     use_openrouter: bool = False,
     model_id: str | None = None,
-    use_reasoning: bool = False,
+    chunk_tokens: int = 1500,
+    overlap_tokens: int = 100,
     run_log: dict | None = None,
-) -> str | None:
-    """
-    교정된 전사문 전체를 단일 LLM 호출로 처리해 족보 강조 + 통합 학습포인트 추출.
-    72B 모델의 대용량 컨텍스트를 활용하여 청크 분할 없이 처리.
-    """
-    if use_local:
-        client = OLLAMA_CLIENT
-        default_model = "qwen2.5:7b"
-    elif use_openrouter:
-        client = openrouter_client
-        default_model = DEFAULT_OPENROUTER_MODEL
-    else:
-        client = hf_client
-        default_model = RELIABLE_HF_MODEL_ID
-
+) -> list[dict]:
+    client, default_model = get_llm_client_and_default_model(
+        use_local=use_local,
+        use_openrouter=use_openrouter,
+        purpose="highlight_extract",
+    )
     if client is None:
-        print("  ❌  포맷 레이어: LLM 클라이언트 미초기화 (API 키 확인)")
-        return None
-    assert client is not None
+        print("  ❌  하이라이트 추출 레이어: LLM 클라이언트 미초기화")
+        return []
 
-    target_model = model_id if model_id else default_model
-    transcript_chars = len(corrected_transcript)
-    print(f"🧠  Layer c: {target_model} 으로 최종 포맷 중... (전사문 {transcript_chars:,}자, 청크 단위 호출)")
+    target_model = model_id or default_model
+    chunks = chunk_text_by_estimated_tokens(
+        corrected_transcript,
+        chunk_tokens=chunk_tokens,
+        overlap_tokens=overlap_tokens,
+    )
+    print(f"🧩  하이라이트 추출: {target_model} / {len(chunks)}개 청크", flush=True)
 
     if run_log is not None:
-        run_log["format_layer"]["input_chars"] = transcript_chars
-        run_log["format_layer"]["model"] = target_model
+        run_log["highlight_extract_layer"]["model"] = target_model
+        run_log["highlight_extract_layer"]["input_chars"] = len(corrected_transcript)
+        run_log["highlight_extract_layer"]["chunks"] = len(chunks)
+        chunk_log_path = init_chunk_highlights_file(run_log)
+        run_log["artifacts"]["chunk_highlights"] = str(chunk_log_path)
+    else:
+        chunk_log_path = None
 
-    # 청크 단위 처리 (이미 보수적인 10,000자 기준)
-    chunk_size = 10000
-    transcript_chunks = [corrected_transcript[i:i + chunk_size] for i in range(0, transcript_chars, chunk_size)]
-    final_results = []
+    results: list[dict] = []
+    for chunk in chunks:
+        system_msg = _highlight_extract_system()
+        user_msg = _highlight_extract_user(chunk, lecture_title=lecture_title, subject_hint=subject_hint)
+        max_tokens = HIGHLIGHT_EXTRACT_MAX_TOKENS
+        print(f"  📦  청크 추출 중 ({chunk['chunk_id']}/{len(chunks)})...", flush=True)
 
-    for idx, chunk in enumerate(transcript_chunks):
-        print(f"  📦  청크 처리 중 ({idx+1}/{len(transcript_chunks)})...")
-        system_msg = _layer_c_system(medical_map)
-        
-        is_last = (idx == len(transcript_chunks) - 1)
-        last_chunk_msg = '마지막 청크입니다. 반드시 전사문 끝에 "## 학습 포인트" 섹션을 추가하고 bullet point로 정리하세요.' if is_last else '마지막 청크가 아닙니다.'
-        
-        user_msg = (
-            f"### 족보 레퍼런스 (급분바 섹션 - 일부)\n{jokbo_text[:2000]}\n\n"
-            f"### 교정된 강의 전사문 (청크 {idx+1}/{len(transcript_chunks)})\n{chunk}\n\n"
-            "#### 작업:\n"
-            "- 족보 키워드/개념 Bold 처리\n"
-            "- 교수님 강조 표현 Bold 처리\n"
-            "- 원문 뉘앙스 보존\n"
-            "- (주의) 마지막 청크가 아닐 경우 '## 학습 포인트' 섹션을 추가하지 마세요.\n"
-            f"- {last_chunk_msg}\n"
-        )
-        
-        max_tokens = _safe_max_tokens(system_msg, user_msg, desired=8192)
-        success = False
+        extracted_text = ""
         for attempt in range(3):
             try:
                 kwargs = {
                     "model": target_model,
                     "messages": [
                         {"role": "system", "content": system_msg},
-                        {"role": "user",   "content": user_msg},
+                        {"role": "user", "content": user_msg},
                     ],
                     "max_tokens": max_tokens,
-                    "temperature": 0.1,
+                    "temperature": 0,
                 }
-                if use_openrouter and use_reasoning:
-                    kwargs["extra_body"] = {"reasoning": {"enabled": True}}
-
-                completion = client.chat.completions.create(**kwargs)
-                content = completion.choices[0].message.content
+                if use_openrouter:
+                    kwargs["extra_body"] = {"reasoning": {"effort": "none", "exclude": True}}
+                resp = client.chat.completions.create(**kwargs)
+                content = (resp.choices[0].message.content or "").strip()
+                content = re.sub(r"^```(?:markdown|md|text)?\s*", "", content, flags=re.IGNORECASE)
+                content = re.sub(r"\s*```$", "", content)
                 if content:
-                    final_results.append(content.strip())
-                    success = True
+                    extracted_text = content
                     break
             except Exception as e:
-                print(f"    ⚠️  청크 {idx+1} 시도 {attempt+1} 실패: {e}")
-                time.sleep(2)
-        
-        if not success:
-            print(f"  ❌  청크 {idx+1} 최종 실패 → 원본 청크 사용")
-            final_results.append(chunk)
+                print(f"    ⚠️  청크 {chunk['chunk_id']} 시도 {attempt+1} 실패: {e}", flush=True)
+                time.sleep(1)
 
-    result = "\n\n".join(final_results)
+        record = {
+            "chunk_id": int(chunk["chunk_id"]),
+            "start_char": int(chunk["start_char"]),
+            "end_char": int(chunk["end_char"]),
+            "estimated_tokens": int(chunk["estimated_tokens"]),
+            "extracted_text": extracted_text,
+        }
+        results.append(record)
+        if chunk_log_path is not None:
+            append_chunk_highlight(chunk_log_path, record)
+        status = f"{len(extracted_text)}자" if extracted_text else "빈 추출"
+        print(f"    ✅  청크 {chunk['chunk_id']} 완료 ({status})", flush=True)
+
     if run_log is not None:
-        run_log["format_layer"]["output_chars"] = len(result)
-    return result
+        run_log["highlight_extract_layer"]["output_chars"] = sum(
+            len(json.dumps(item, ensure_ascii=False)) for item in results
+        )
+    return results
+
+
+def synthesize_study_brief(
+    chunk_records: list[dict],
+    subject_hint: str = "",
+    lecture_title: str = "",
+    *,
+    use_local: bool = False,
+    use_openrouter: bool = False,
+    model_id: str | None = None,
+    run_log: dict | None = None,
+) -> str | None:
+    client, default_model = get_llm_client_and_default_model(
+        use_local=use_local,
+        use_openrouter=use_openrouter,
+        purpose="highlight_synthesis",
+    )
+    if client is None:
+        print("  ❌  하이라이트 통합 레이어: LLM 클라이언트 미초기화")
+        return None
+
+    target_model = model_id or default_model
+    system_msg = _highlight_synthesis_system()
+    user_msg = _highlight_synthesis_user(chunk_records, lecture_title=lecture_title, subject_hint=subject_hint)
+    max_tokens = _bounded_max_tokens(
+        system_msg,
+        user_msg,
+        desired=HIGHLIGHT_SYNTHESIS_MAX_TOKENS,
+        floor=1200,
+    )
+    print(f"🧠  하이라이트 통합: {target_model} / max_tokens={max_tokens}", flush=True)
+
+    if run_log is not None:
+        run_log["highlight_synthesis_layer"]["model"] = target_model
+        run_log["highlight_synthesis_layer"]["input_chars"] = len(user_msg)
+
+    for attempt in range(3):
+        try:
+            kwargs = {
+                "model": target_model,
+                "messages": [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_msg},
+                ],
+                "max_tokens": max_tokens,
+                "temperature": 0.1,
+            }
+            if use_openrouter:
+                kwargs["extra_body"] = {"reasoning": {"effort": "none", "exclude": True}}
+            resp = client.chat.completions.create(**kwargs)
+            content = (resp.choices[0].message.content or "").strip()
+            if content:
+                if run_log is not None:
+                    run_log["highlight_synthesis_layer"]["output_chars"] = len(content)
+                return content
+        except Exception as e:
+            print(f"  ⚠️  하이라이트 통합 시도 {attempt+1} 실패: {e}", flush=True)
+            time.sleep(1)
+
+    print("  ❌  하이라이트 통합 실패", flush=True)
+    return None
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1408,17 +1691,24 @@ def postprocess_transcript(
     jokbo_text: str,
     medical_map: str,
     lecture_title: str = "",
+    highlight_subject_hint: str = "",
     use_local: bool = False,
     use_openrouter: bool = False,
     model_id: str | None = None,
     use_reasoning: bool = False,
     run_log: dict | None = None,
     correction_only: bool = False,
-) -> tuple[str, str | None]:
+    generate_study_brief: bool = False,
+    highlight_extract_model: str | None = None,
+    highlight_synthesis_model: str | None = None,
+    highlight_chunk_tokens: int = 1500,
+    highlight_overlap_tokens: int = 100,
+) -> tuple[str, str | None, list[dict]]:
     """
-    2-step postprocessing:
-    Step 1 → correct_with_jokbo    (족보 기반 STT 오인식 교정)
-    Step 2 → emphasize_and_format  (Bold 강조 + 통합 학습포인트)
+    3-step postprocessing:
+    Step 1 → correct_with_jokbo
+    Step 2 → extract_chunk_highlights
+    Step 3 → synthesize_study_brief
     """
     print("✏️   Step 1: 족보 기반 오인식 교정 중...")
     corrected = correct_with_jokbo(
@@ -1428,16 +1718,30 @@ def postprocess_transcript(
     )
 
     if correction_only:
-        print("📝  correction-only 모드: 포맷 레이어를 건너뜁니다.")
-        return corrected, None
+        print("📝  correction-only 모드: 최종 하이라이트 레이어를 건너뜁니다.")
+        return corrected, None, []
 
-    print("📝  Step 2: 강조 포맷 및 학습포인트 추출 중...")
-    notes = emphasize_and_format(
-        corrected, jokbo_text, medical_map,
+    print("📝  Step 2: 청크별 강조점 추출 중...")
+    chunk_records = extract_chunk_highlights(
+        corrected, highlight_subject_hint, lecture_title=lecture_title,
         use_local=use_local, use_openrouter=use_openrouter,
-        model_id=model_id, use_reasoning=use_reasoning, run_log=run_log
+        model_id=highlight_extract_model,
+        chunk_tokens=highlight_chunk_tokens,
+        overlap_tokens=highlight_overlap_tokens,
+        run_log=run_log,
     )
-    return corrected, notes
+    if not generate_study_brief:
+        print("📝  extracted-notes 기본 모드: study brief 생성을 건너뜁니다.")
+        return corrected, None, chunk_records
+
+    print("📝  Step 3: 최종 강조점 통합 중...")
+    notes = synthesize_study_brief(
+        chunk_records, highlight_subject_hint, lecture_title=lecture_title,
+        use_local=use_local, use_openrouter=use_openrouter,
+        model_id=highlight_synthesis_model,
+        run_log=run_log,
+    )
+    return corrected, notes, chunk_records
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1449,7 +1753,9 @@ def main():
     parser.add_argument("--whisper-only",   action="store_true",
                         help="Whisper 전사만 실행 (LLM postprocessing 생략)")
     parser.add_argument("--correction-only", action="store_true",
-                        help="Whisper 전사 후 교정본까지만 저장 (포맷 레이어 생략)")
+                        help="Whisper 전사 후 교정본까지만 저장 (하이라이트 레이어 생략)")
+    parser.add_argument("--highlights-only", action="store_true",
+                        help="기존 corrected transcript로 하이라이트 레이어만 실행")
     parser.add_argument("--debug-medical-map", action="store_true",
                         help="medical map 추출 디버그 정보를 logs/ 에 별도 저장")
     parser.add_argument("--compress-for-api", action="store_true",
@@ -1467,7 +1773,17 @@ def main():
     parser.add_argument("--subject-router-model", type=str, default=DEFAULT_SUBJECT_ROUTER_MODEL,
                         help=f"강의명 subject 라우터 모델 (기본: {DEFAULT_SUBJECT_ROUTER_MODEL})")
     parser.add_argument("--reprocess",      action="store_true",
-                        help="output/ 기존 transcript를 재처리해 lecture_notes 생성")
+                        help="output/ 기존 transcript를 재처리")
+    parser.add_argument("--highlight-extract-model", type=str, default=DEFAULT_HIGHLIGHT_EXTRACT_MODEL,
+                        help=f"청크 추출 모델 (기본: {DEFAULT_HIGHLIGHT_EXTRACT_MODEL})")
+    parser.add_argument("--study-brief", action="store_true",
+                        help="최종 study brief까지 추가 생성 (기본은 extracted notes만 저장)")
+    parser.add_argument("--highlight-synthesis-model", type=str, default=DEFAULT_HIGHLIGHT_SYNTHESIS_MODEL,
+                        help=f"최종 통합 모델 (기본: {DEFAULT_HIGHLIGHT_SYNTHESIS_MODEL})")
+    parser.add_argument("--highlight-chunk-tokens", type=int, default=1500,
+                        help="청크 추출용 목표 토큰 수 (기본: 1500)")
+    parser.add_argument("--highlight-overlap-tokens", type=int, default=100,
+                        help="청크 겹침 토큰 수 (기본: 100)")
     parser.add_argument("--local",          action="store_true",
                         help="로컬 Ollama 사용 (HF Router 대신)")
     parser.add_argument("--openrouter",     action="store_true",
@@ -1500,20 +1816,25 @@ def main():
         print("💡  모드: Whisper 전사만 (LLM 생략)")
     elif args.correction_only:
         print("💡  모드: 교정본까지만 저장 (포맷 레이어 생략)")
+    elif args.highlights_only:
+        print("💡  모드: corrected transcript -> 하이라이트 레이어만 실행")
+    else:
+        print("💡  모드: 교정본 + 최종 강조점 정리본 생성")
 
-    if args.whisper_only and args.correction_only:
-        print("❌  --whisper-only 와 --correction-only 는 함께 사용할 수 없습니다.")
+    enabled_modes = sum(bool(x) for x in [args.whisper_only, args.correction_only, args.highlights_only])
+    if enabled_modes > 1:
+        print("❌  --whisper-only, --correction-only, --highlights-only 는 함께 사용할 수 없습니다.")
         return
 
     # ── --reprocess 모드 ────────────────────────────────────────────────────
     if args.reprocess:
         print("🔄  기존 transcript 재처리 중...")
-        transcript_files = list(OUTPUT_DIR.glob("*_transcript.txt"))
+        transcript_files = get_transcript_paths()
         if args.file:
             target_base = group_audio_stem(Path(args.file).stem)
             transcript_files = [
                 tp for tp in transcript_files
-                if group_audio_stem(strip_known_suffix(tp.stem, "_transcript")) == target_base
+                if get_base_name_from_transcript_path(tp) == target_base
             ]
             if transcript_files:
                 print(f"🎯  재처리 대상 제한: {', '.join(tp.name for tp in sorted(transcript_files))}")
@@ -1522,7 +1843,8 @@ def main():
             return
 
         for tp in transcript_files:
-            print(f"\n--- 재처리: {tp.name} ---")
+            base_name = get_base_name_from_transcript_path(tp)
+            print(f"\n--- 재처리: {base_name} ---")
             with open(tp, "r", encoding="utf-8") as f:
                 transcript = f.read()
 
@@ -1531,7 +1853,7 @@ def main():
             medical_map = ""
             medical_map_debug = {}
             lecture_title = args.lecture_title or ""
-            matched_pdf = find_matching_jokbo(tp.name, JOKBO_DIR)
+            matched_pdf = find_matching_jokbo(base_name, JOKBO_DIR)
             if matched_pdf:
                 lecture_title = lecture_title or extract_lecture_title(matched_pdf.name)
                 jokbo_text = extract_jukbo_section(matched_pdf)
@@ -1543,10 +1865,10 @@ def main():
                 )
                 medical_map = medical_map_debug["final_prompt"]
             else:
-                print(f"⚠️   [경고] '{tp.name}'에 매칭되는 족보를 찾지 못했습니다.")
+                print(f"⚠️   [경고] '{base_name}'에 매칭되는 족보를 찾지 못했습니다.")
                 # reprocess에서는 인터랙티브 대기보다 경고 후 진행 (혹은 필요시 추가)
 
-            run_log = create_run_log(tp.name)
+            run_log = create_run_log(base_name)
             run_log["injection"] = {
                 **medical_map_debug,
                 "lecture_title": lecture_title,
@@ -1556,24 +1878,140 @@ def main():
             if args.debug_medical_map and jokbo_text:
                 save_medical_map_debug(run_log, matched_pdf, run_log["injection"])
 
-            corrected, notes = postprocess_transcript(
+            highlight_subjects = set(medical_map_debug.get("title_subjects", [])) or infer_title_subjects(lecture_title)
+            highlight_subject_hint = build_highlight_subject_hint(highlight_subjects)
+
+            corrected, notes, chunk_records = postprocess_transcript(
                 transcript, jokbo_text, medical_map, lecture_title=lecture_title,
+                highlight_subject_hint=highlight_subject_hint,
                 use_local=args.local, use_openrouter=args.openrouter,
                 model_id=args.model, use_reasoning=args.use_reasoning,
                 run_log=run_log,
-                correction_only=args.correction_only
+                correction_only=args.correction_only,
+                generate_study_brief=args.study_brief,
+                highlight_extract_model=args.highlight_extract_model,
+                highlight_synthesis_model=args.highlight_synthesis_model,
+                highlight_chunk_tokens=args.highlight_chunk_tokens,
+                highlight_overlap_tokens=args.highlight_overlap_tokens,
             )
 
-            corrected_out = OUTPUT_DIR / f"{tp.stem.replace('_transcript', '')}_corrected_transcript.txt"
+            corrected_out = OUTPUT_DIR / f"{base_name}_corrected_transcript.txt"
             with open(corrected_out, "w", encoding="utf-8") as f:
                 f.write(corrected)
             print(f"🎉  corrected transcript 저장: {corrected_out}")
+            run_log["artifacts"]["corrected_transcript"] = str(corrected_out)
+
+            if chunk_records:
+                chunk_path = save_chunk_highlights(run_log, chunk_records)
+                run_log["artifacts"]["chunk_highlights"] = str(chunk_path)
+                extracted_out = OUTPUT_DIR / f"{base_name}_extracted_notes.md"
+                extracted_md = render_extracted_notes(chunk_records, lecture_title=lecture_title or base_name)
+                with open(extracted_out, "w", encoding="utf-8") as f:
+                    f.write(extracted_md)
+                print(f"🎉  extracted notes 저장: {extracted_out}")
+                run_log["artifacts"]["extracted_notes"] = str(extracted_out)
 
             if notes:
-                out = OUTPUT_DIR / f"{tp.stem.replace('_transcript', '')}_lecture_notes.md"
+                out = OUTPUT_DIR / f"{base_name}_study_brief.md"
                 with open(out, "w", encoding="utf-8") as f:
                     f.write(notes)
-                print(f"🎉  lecture notes 저장: {out}")
+                print(f"🎉  study brief 저장: {out}")
+                run_log["artifacts"]["study_brief"] = str(out)
+
+            save_run_log(run_log)
+        return
+
+    # ── --highlights-only 모드 ─────────────────────────────────────────────
+    if args.highlights_only:
+        print("🔄  기존 corrected transcript로 하이라이트 생성 중...")
+        corrected_files = get_corrected_transcript_paths()
+        if args.file:
+            target_base = group_audio_stem(Path(args.file).stem)
+            corrected_files = [
+                cp for cp in corrected_files
+                if get_base_name_from_corrected_path(cp) == target_base
+            ]
+            if corrected_files:
+                print(f"🎯  하이라이트 대상 제한: {', '.join(cp.name for cp in sorted(corrected_files))}")
+        if not corrected_files:
+            print(f"⚠️   '{OUTPUT_DIR}'에 corrected transcript 파일 없음.")
+            return
+
+        for cp in corrected_files:
+            base_name = get_base_name_from_corrected_path(cp)
+            print(f"\n--- 하이라이트 생성: {base_name} ---")
+            with open(cp, "r", encoding="utf-8") as f:
+                corrected_transcript = f.read()
+
+            jokbo_text = ""
+            medical_map = ""
+            medical_map_debug = {}
+            lecture_title = args.lecture_title or ""
+            matched_pdf = find_matching_jokbo(base_name, JOKBO_DIR)
+            if matched_pdf:
+                lecture_title = lecture_title or extract_lecture_title(matched_pdf.name)
+                jokbo_text = extract_jukbo_section(matched_pdf)
+                medical_map_debug = analyze_medical_keywords(
+                    jokbo_text,
+                    lecture_title=lecture_title,
+                    subject_router_model=args.subject_router_model,
+                    use_subject_router=not args.disable_subject_router,
+                )
+                medical_map = medical_map_debug["final_prompt"]
+            else:
+                print(f"⚠️   [경고] '{base_name}'에 매칭되는 족보를 찾지 못했습니다.")
+
+            run_log = create_run_log(f"{base_name}_highlights")
+            run_log["injection"] = {
+                **medical_map_debug,
+                "lecture_title": lecture_title,
+                "jokbo_section_chars": len(jokbo_text),
+                "final_prompt": medical_map,
+            }
+            if args.debug_medical_map and jokbo_text:
+                save_medical_map_debug(run_log, matched_pdf, run_log["injection"])
+
+            highlight_subjects = set(medical_map_debug.get("title_subjects", [])) or infer_title_subjects(lecture_title)
+            highlight_subject_hint = build_highlight_subject_hint(highlight_subjects)
+
+            chunk_records = extract_chunk_highlights(
+                corrected_transcript,
+                highlight_subject_hint,
+                lecture_title=lecture_title,
+                use_local=args.local,
+                use_openrouter=args.openrouter,
+                model_id=args.highlight_extract_model,
+                chunk_tokens=args.highlight_chunk_tokens,
+                overlap_tokens=args.highlight_overlap_tokens,
+                run_log=run_log,
+            )
+            chunk_path = save_chunk_highlights(run_log, chunk_records)
+            run_log["artifacts"]["chunk_highlights"] = str(chunk_path)
+            extracted_out = OUTPUT_DIR / f"{base_name}_extracted_notes.md"
+            extracted_md = render_extracted_notes(chunk_records, lecture_title=lecture_title or base_name)
+            with open(extracted_out, "w", encoding="utf-8") as f:
+                f.write(extracted_md)
+            print(f"🎉  Extracted notes 저장: {extracted_out}")
+            run_log["artifacts"]["extracted_notes"] = str(extracted_out)
+
+            if args.study_brief:
+                notes = synthesize_study_brief(
+                    chunk_records,
+                    highlight_subject_hint,
+                    lecture_title=lecture_title,
+                    use_local=args.local,
+                    use_openrouter=args.openrouter,
+                    model_id=args.highlight_synthesis_model,
+                    run_log=run_log,
+                )
+                if notes:
+                    out = OUTPUT_DIR / f"{base_name}_study_brief.md"
+                    with open(out, "w", encoding="utf-8") as f:
+                        f.write(notes)
+                    print(f"🎉  Study brief 저장: {out}")
+                    run_log["artifacts"]["study_brief"] = str(out)
+            else:
+                print("📝  extracted-notes 기본 모드: study brief 생성을 건너뜁니다.")
 
             save_run_log(run_log)
         return
@@ -1664,34 +2102,56 @@ def main():
         if args.debug_medical_map and jokbo_text:
             save_medical_map_debug(run_log, matched_pdf, run_log["injection"])
 
+        highlight_subjects = set(medical_map_debug.get("title_subjects", [])) or infer_title_subjects(lecture_title)
+        highlight_subject_hint = build_highlight_subject_hint(highlight_subjects)
+
         # transcript 저장
         tp = OUTPUT_DIR / f"{base_name}_transcript.txt"
         with open(tp, "w", encoding="utf-8") as f:
             f.write(combined_transcript)
         print(f"💾  통합 Transcript 저장: {tp}")
+        run_log["artifacts"]["transcript"] = str(tp)
 
         if args.whisper_only:
             save_run_log(run_log)
             continue
 
-        corrected, notes = postprocess_transcript(
+        corrected, notes, chunk_records = postprocess_transcript(
             combined_transcript, jokbo_text, medical_map, lecture_title=lecture_title,
+            highlight_subject_hint=highlight_subject_hint,
             use_local=args.local, use_openrouter=args.openrouter,
             model_id=args.model, use_reasoning=args.use_reasoning,
             run_log=run_log,
-            correction_only=args.correction_only
+            correction_only=args.correction_only,
+            generate_study_brief=args.study_brief,
+            highlight_extract_model=args.highlight_extract_model,
+            highlight_synthesis_model=args.highlight_synthesis_model,
+            highlight_chunk_tokens=args.highlight_chunk_tokens,
+            highlight_overlap_tokens=args.highlight_overlap_tokens,
         )
 
         corrected_path = OUTPUT_DIR / f"{base_name}_corrected_transcript.txt"
         with open(corrected_path, "w", encoding="utf-8") as f:
             f.write(corrected)
         print(f"🎉  Corrected transcript 저장: {corrected_path}")
+        run_log["artifacts"]["corrected_transcript"] = str(corrected_path)
+
+        if chunk_records:
+            chunk_path = save_chunk_highlights(run_log, chunk_records)
+            run_log["artifacts"]["chunk_highlights"] = str(chunk_path)
+            extracted_out = OUTPUT_DIR / f"{base_name}_extracted_notes.md"
+            extracted_md = render_extracted_notes(chunk_records, lecture_title=lecture_title or base_name)
+            with open(extracted_out, "w", encoding="utf-8") as f:
+                f.write(extracted_md)
+            print(f"🎉  Extracted notes 저장: {extracted_out}")
+            run_log["artifacts"]["extracted_notes"] = str(extracted_out)
 
         if notes:
-            out = OUTPUT_DIR / f"{base_name}_lecture_notes.md"
+            out = OUTPUT_DIR / f"{base_name}_study_brief.md"
             with open(out, "w", encoding="utf-8") as f:
                 f.write(notes)
-            print(f"🎉  Lecture notes 저장: {out}")
+            print(f"🎉  Study brief 저장: {out}")
+            run_log["artifacts"]["study_brief"] = str(out)
 
         save_run_log(run_log)
 
